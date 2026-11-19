@@ -20,3 +20,4 @@ gh-profile = "gh_profile.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+license = { text = "MIT" }
