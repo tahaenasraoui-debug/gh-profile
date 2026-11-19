@@ -61,3 +61,8 @@ export GITHUB_TOKEN="ghp_your_token_here"
 - [HTTPX](https://www.python-httpx.org/)
 - [Pillow](https://python-pillow.org/)
 - [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/)
+
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
