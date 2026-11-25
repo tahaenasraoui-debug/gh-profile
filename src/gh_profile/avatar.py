@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from rich.style import Style
 from rich.text import Text
 
@@ -24,18 +24,20 @@ def _has_light_background(img: Image.Image) -> bool:
     return light_corners >= 3
 
 
-def render_avatar_halfblocks(
+def render_avatar_ascii(
     image_bytes: bytes | None,
     width: int = 30,
     height_rows: int = 15,
 ) -> Text:
-    """Convert raw image bytes into neofetch-style 24-bit colored ASCII art."""
+    """Convert raw image bytes into neofetch-style 24-bit RGB colored ASCII art."""
     if not image_bytes:
         return Text("[No Avatar Available]", style="dim italic")
+    if width <= 0 or height_rows <= 0:
+        return Text("")
 
     try:
         img = Image.open(BytesIO(image_bytes)).convert("RGBA")
-    except Exception:
+    except (UnidentifiedImageError, OSError, ValueError):
         return Text("[Invalid Avatar Image]", style="dim italic")
 
     canvas = Image.new("RGBA", img.size, (*DEFAULT_BG, 255))
@@ -46,6 +48,8 @@ def render_avatar_halfblocks(
     resized = rgb_img.resize((width, height_rows), Image.Resampling.LANCZOS)
     strip_white_bg = _has_light_background(resized)
     pixels = resized.load()
+    if pixels is None:
+        return Text("[Invalid Avatar Image]", style="dim italic")
 
     ramp_len = len(ASCII_RAMP) - 1
     output = Text()
@@ -69,3 +73,6 @@ def render_avatar_halfblocks(
             output.append("\n")
 
     return output
+
+
+render_avatar_halfblocks = render_avatar_ascii

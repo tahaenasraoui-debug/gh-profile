@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "gh-profile"
 version = "0.1.0"
 description = "A multi-pane terminal UI for viewing GitHub user profiles."
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "textual>=0.70.0",
@@ -15,9 +17,28 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tahaenasraoui-debug/gh-profile"
+Repository = "https://github.com/tahaenasraoui-debug/gh-profile"
+Issues = "https://github.com/tahaenasraoui-debug/gh-profile/issues"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
 [project.scripts]
 gh-profile = "gh_profile.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-license = { text = "MIT" }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "BLE", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

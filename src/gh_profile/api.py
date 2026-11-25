@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
+import logging
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 GITHUB_GRAPHQL = "https://api.github.com/graphql"
@@ -68,22 +73,31 @@ class ProfileData:
     warnings: list[str] = field(default_factory=list)
 
 
-def get_github_token() -> str | None:
+async def get_github_token() -> str | None:
     """Resolve a GitHub token from environment variables or the `gh` CLI."""
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
+    if token and token.strip():
         return token.strip()
     try:
-        result = subprocess.run(
-            ["gh", "auth", "token"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
+        proc = await asyncio.create_subprocess_exec(
+            "gh",
+            "auth",
+            "token",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.SubprocessError):
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            return None
+        if proc.returncode == 0 and stdout:
+            resolved = stdout.decode("utf-8", errors="replace").strip()
+            if resolved:
+                return resolved
+    except OSError:
         pass
     return None
 
@@ -98,24 +112,51 @@ def _build_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
+def _extract_error_message(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            return payload["message"]
+    except ValueError:
+        pass
+    return response.text
+
+
 def _check_rate_limit(response: httpx.Response) -> None:
-    if response.status_code in (403, 429):
-        remaining = response.headers.get("X-RateLimit-Remaining")
-        if remaining == "0" or response.status_code == 429:
-            raise RateLimitError(
-                "GitHub API rate limit exceeded. Set GITHUB_TOKEN or run `gh auth login`."
-            )
+    if response.status_code not in (403, 429):
+        return
+
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    retry_after = response.headers.get("Retry-After")
+    lowered = _extract_error_message(response).lower()
+
+    is_secondary = (
+        retry_after is not None
+        or "secondary rate limit" in lowered
+        or "abuse detection" in lowered
+        or "rate limit" in lowered
+    )
+
+    if response.status_code == 429 or remaining == "0" or is_secondary:
+        is_sec_403 = response.status_code == 403 and remaining != "0" and is_secondary
+        kind = "secondary " if is_sec_403 else ""
+        retry_hint = f" Retry after {retry_after}s." if retry_after else ""
+        raise RateLimitError(
+            f"GitHub API {kind}rate limit exceeded.{retry_hint} "
+            "Set GITHUB_TOKEN or run `gh auth login`."
+        )
 
 
 async def fetch_profile_data(username: str) -> ProfileData:
     """Fetch user profile, avatar, README, and contribution calendar."""
-    token = get_github_token()
+    token = await get_github_token()
     headers = _build_headers(token)
     warnings: list[str] = []
+    encoded_user = quote(username, safe="")
 
     async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
         # 1. Fetch core user profile
-        user_resp = await client.get(f"{GITHUB_API}/users/{username}")
+        user_resp = await client.get(f"{GITHUB_API}/users/{encoded_user}")
         _check_rate_limit(user_resp)
         if user_resp.status_code == 404:
             raise UserNotFoundError(f"GitHub user '@{username}' was not found.")
@@ -136,7 +177,9 @@ async def fetch_profile_data(username: str) -> ProfileData:
         # 3. Fetch profile README ({username}/{username})
         readme_raw: str | None = None
         try:
-            readme_resp = await client.get(f"{GITHUB_API}/repos/{username}/{username}/readme")
+            readme_resp = await client.get(
+                f"{GITHUB_API}/repos/{encoded_user}/{encoded_user}/readme"
+            )
             _check_rate_limit(readme_resp)
             if readme_resp.status_code == 200:
                 payload = readme_resp.json()
@@ -151,7 +194,7 @@ async def fetch_profile_data(username: str) -> ProfileData:
         # 4. Fetch contribution calendar (GraphQL if token available, else HTML scrape)
         contributions: ContributionCalendar | None = None
         if token:
-            contributions = await _fetch_contributions_graphql(client, username)
+            contributions = await _fetch_contributions_graphql(client, username, warnings=warnings)
         if contributions is None:
             contributions = await _fetch_contributions_scrape(client, username)
         if contributions is None:
@@ -178,7 +221,9 @@ async def fetch_profile_data(username: str) -> ProfileData:
 
 
 async def _fetch_contributions_graphql(
-    client: httpx.AsyncClient, username: str
+    client: httpx.AsyncClient,
+    username: str,
+    warnings: list[str] | None = None,
 ) -> ContributionCalendar | None:
     query = """
     query($username: String!) {
@@ -203,15 +248,34 @@ async def _fetch_contributions_graphql(
             GITHUB_GRAPHQL,
             json={"query": query, "variables": {"username": username}},
         )
+        _check_rate_limit(resp)
         if resp.status_code != 200:
+            logger.warning(
+                "GitHub GraphQL returned status %s for @%s",
+                resp.status_code,
+                username,
+            )
+            if warnings is not None:
+                warnings.append("GraphQL contributions unavailable; used HTML fallback.")
             return None
+
         data = resp.json()
-        cal = (
-            data.get("data", {})
-            .get("user", {})
-            .get("contributionsCollection", {})
-            .get("contributionCalendar")
-        )
+        if not isinstance(data, dict):
+            logger.warning("Unexpected GraphQL response type for @%s", username)
+            return None
+
+        errors = data.get("errors")
+        if errors:
+            messages = [
+                str(err.get("message", err)) if isinstance(err, dict) else str(err)
+                for err in errors
+            ]
+            logger.warning("GitHub GraphQL errors for @%s: %s", username, "; ".join(messages))
+            if warnings is not None:
+                warnings.append("GraphQL query returned errors; used HTML fallback.")
+
+        user_data = (data.get("data") or {}).get("user") or {}
+        cal = (user_data.get("contributionsCollection") or {}).get("contributionCalendar")
         if not cal:
             return None
 
@@ -229,7 +293,19 @@ async def _fetch_contributions_graphql(
                 weeks.append(days)
 
         return ContributionCalendar(total=int(cal.get("totalContributions", 0)), weeks=weeks)
-    except Exception:
+    except RateLimitError as exc:
+        logger.warning(
+            "Rate limit hit during GraphQL contributions query for @%s: %s",
+            username,
+            exc,
+        )
+        if warnings is not None:
+            warnings.append("Rate limit hit on GraphQL contributions; used HTML fallback.")
+        return None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Failed to fetch GraphQL contributions for @%s: %s", username, exc)
+        if warnings is not None:
+            warnings.append("GraphQL contributions failed; used HTML fallback.")
         return None
 
 
@@ -237,12 +313,18 @@ async def _fetch_contributions_scrape(
     client: httpx.AsyncClient, username: str
 ) -> ContributionCalendar | None:
     """Fallback scraper for https://github.com/users/{username}/contributions."""
+    encoded_user = quote(username, safe="")
     try:
         resp = await client.get(
-            f"https://github.com/users/{username}/contributions",
+            f"https://github.com/users/{encoded_user}/contributions",
             headers={"X-Requested-With": "XMLHttpRequest", "Accept": "text/html"},
         )
         if resp.status_code != 200:
+            logger.warning(
+                "GitHub contributions page returned status %s for @%s",
+                resp.status_code,
+                username,
+            )
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -287,5 +369,6 @@ async def _fetch_contributions_scrape(
             weeks.append(current_week)
 
         return ContributionCalendar(total=total, weeks=weeks)
-    except Exception:
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:
+        logger.warning("Failed to scrape contributions for @%s: %s", username, exc)
         return None

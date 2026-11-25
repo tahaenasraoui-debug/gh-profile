@@ -1,5 +1,8 @@
 # gh-profile
 
+[![CI](https://github.com/tahaenasraoui-debug/gh-profile/actions/workflows/ci.yml/badge.svg)](https://github.com/tahaenasraoui-debug/gh-profile/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A multi-pane terminal UI (TUI) for viewing GitHub user profiles, built with Python, `textual`, and `rich`.
 
 ![gh-profile screenshot](assets/screenshot.png)
@@ -17,7 +20,7 @@ A multi-pane terminal UI (TUI) for viewing GitHub user profiles, built with Pyth
 Requires Python 3.10+.
 
 ```bash
-git clone [https://github.com/tahaenasraoui-debug/gh-profile.git](https://github.com/tahaenasraoui-debug/gh-profile.git)
+git clone https://github.com/tahaenasraoui-debug/gh-profile.git
 cd gh-profile
 python -m venv .venv
 source .venv/bin/activate

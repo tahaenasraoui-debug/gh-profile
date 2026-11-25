@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from typing import ClassVar
+
+import httpx
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, LoadingIndicator, Markdown, Static
 
@@ -14,7 +17,7 @@ from gh_profile.api import (
     UserNotFoundError,
     fetch_profile_data,
 )
-from gh_profile.avatar import render_avatar_halfblocks
+from gh_profile.avatar import render_avatar_ascii
 from gh_profile.heatmap import render_heatmap
 from gh_profile.readme import Badge, preprocess_readme, render_badges_row
 
@@ -83,7 +86,7 @@ class GitHubProfileApp(App[None]):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("j", "scroll_readme_down", "Scroll Down"),
@@ -103,7 +106,11 @@ class GitHubProfileApp(App[None]):
             with VerticalScroll(id="readme-pane"):
                 yield LoadingIndicator(id="readme-loader")
         with Vertical(id="heatmap-pane"):
-            yield Static("Loading contribution graph...", id="heatmap-content", classes="status-muted")
+            yield Static(
+                "Loading contribution graph...",
+                id="heatmap-content",
+                classes="status-muted",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -144,7 +151,7 @@ class GitHubProfileApp(App[None]):
         except GitHubError as exc:
             await self._show_error(f"GitHub error: {exc}")
             return
-        except Exception as exc:
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             await self._show_error(f"Network or unexpected error: {exc}")
             return
 
@@ -160,14 +167,16 @@ class GitHubProfileApp(App[None]):
         await sidebar.remove_children()
         await readme_pane.remove_children()
         await sidebar.mount(Static(message, classes="status-error"))
-        await readme_pane.mount(Static("Press 'r' to retry or 'q' to quit.", classes="status-muted"))
+        await readme_pane.mount(
+            Static("Press 'r' to retry or 'q' to quit.", classes="status-muted")
+        )
         heatmap_widget.update("")
 
     async def _render_sidebar(self, data: ProfileData) -> None:
         sidebar = self.query_one("#sidebar", VerticalScroll)
         await sidebar.remove_children()
 
-        avatar_art = render_avatar_halfblocks(data.avatar_bytes, width=28, height_rows=14)
+        avatar_art = render_avatar_ascii(data.avatar_bytes, width=28, height_rows=14)
         await sidebar.mount(Static(avatar_art, id="avatar-view"))
 
         info = Text()

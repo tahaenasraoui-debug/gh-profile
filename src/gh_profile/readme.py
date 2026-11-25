@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from rich.style import Style
 from rich.text import Text
 
@@ -32,19 +33,43 @@ NAMED_COLORS: dict[str, str] = {
     "pink": "#ea4aaa",
 }
 
-BADGE_TOKEN_RE = re.compile(r"\[\[BADGE:([^|\]]+)\|([^\]]+)\]\]")
+BADGE_TOKEN_RE = re.compile(r"\[\[BADGE:([^|\]]+)\|([^|\]]+)\|([^\]]*)\]\]")
+
+_ALT_BODY = r"(?:[^\[\]]|\[[^\[\]]*\])*"
+_URL_BODY = r"(?:[^()\s]|\([^()\s]*\))+"
+_LINKED_MD_IMG_RE = re.compile(
+    rf"\[[ \t]*!\[({_ALT_BODY})\]\(({_URL_BODY})\)[ \t]*\]\(({_URL_BODY})\)"
+)
+_MD_IMG_RE = re.compile(rf"!\[({_ALT_BODY})\]\(((?:https?:)?//{_URL_BODY})\)")
+_FENCE_RE = re.compile(
+    r"(^[ \t]*(`{3,}|~{3,})[^\n]*\n(?:[\s\S]*?\n)?[ \t]*\2[ \t]*$)|```[^\n`]*```",
+    re.MULTILINE,
+)
 
 
 @dataclass
 class Badge:
     label: str
     color: str
+    url: str | None = None
 
 
 @dataclass
 class ReadmeSegment:
     kind: str  # "markdown" or "badges"
     content: str | list[Badge]
+
+
+def _encode_badge_token(badge: Badge) -> str:
+    label = quote(badge.label, safe="")
+    color = quote(badge.color, safe="")
+    url = quote(badge.url or "", safe="")
+    return f"[[BADGE:{label}|{color}|{url}]]"
+
+
+def _decode_badge_token(label: str, color: str, url: str) -> Badge:
+    decoded_url = unquote(url) or None
+    return Badge(label=unquote(label), color=unquote(color), url=decoded_url)
 
 
 def _normalize_color(raw: str | None) -> str:
@@ -107,11 +132,91 @@ def render_badges_row(badges: list[Badge]) -> Text:
         fg = _contrast_fg(badge.color)
         text.append(
             f" {badge.label} ",
-            style=Style(color=fg, bgcolor=badge.color, bold=True),
+            style=Style(color=fg, bgcolor=badge.color, bold=True, link=badge.url or None),
         )
         if i < len(badges) - 1:
             text.append(" ")
     return text
+
+
+def _normalize_inline(text: str) -> str:
+    return re.sub(r"[ \t\r\n]+", " ", text).strip()
+
+
+def _convert_list_item(li: Tag, indent: int, marker: str) -> list[str]:
+    lines: list[str] = []
+    child_indent = indent + len(marker)
+    text_parts: list[str] = []
+    emitted_marker = False
+
+    def _flush_text() -> None:
+        nonlocal emitted_marker
+        combined = _normalize_inline("".join(text_parts))
+        text_parts.clear()
+        if not combined:
+            return
+        if not emitted_marker:
+            lines.append(f"{' ' * indent}{marker}{combined}")
+            emitted_marker = True
+        else:
+            lines.append(f"{' ' * child_indent}{combined}")
+
+    def _walk(node: Tag | NavigableString) -> None:
+        nonlocal emitted_marker
+        if isinstance(node, Tag):
+            if node.name in ("ul", "ol"):
+                _flush_text()
+                if not emitted_marker:
+                    lines.append(f"{' ' * indent}{marker.rstrip()}")
+                    emitted_marker = True
+                nested = _convert_list(node, indent=child_indent)
+                if nested:
+                    lines.append(nested)
+            elif node.name == "br":
+                _flush_text()
+            elif node.find(["ul", "ol"]):
+                for child in node.children:
+                    _walk(child)
+                if node.name in ("p", "div"):
+                    _flush_text()
+            else:
+                text_parts.append(node.get_text())
+                if node.name in ("p", "div"):
+                    _flush_text()
+        else:
+            text_parts.append(str(node))
+
+    for child in li.children:
+        _walk(child)
+    _flush_text()
+    if not emitted_marker:
+        return []
+    return lines
+
+
+def _convert_list(lst: Tag, indent: int = 0) -> str:
+    """Recursively convert HTML <ul>/<ol> elements into indented Markdown lists."""
+    is_ordered = lst.name == "ol"
+    index = 1
+    if is_ordered and lst.get("start") is not None:
+        try:
+            index = int(str(lst["start"]))
+        except ValueError:
+            index = 1
+
+    lines: list[str] = []
+    for child in lst.children:
+        if not isinstance(child, Tag):
+            continue
+        if child.name == "li":
+            marker = f"{index}. " if is_ordered else "- "
+            index += 1
+            lines.extend(_convert_list_item(child, indent=indent, marker=marker))
+        elif child.name in ("ul", "ol"):
+            nested = _convert_list(child, indent=indent + 2)
+            if nested:
+                lines.append(nested)
+    return "\n".join(lines)
 
 
 def _convert_table(table: Tag) -> str:
@@ -185,23 +290,43 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
     Clean HTML tags and shields.io badges from a GitHub profile README
     while preserving tables, cards, lists, and inline formatting.
     """
+    normalized = raw_markdown.replace("\r\n", "\n").replace("\r", "\n")
+
+    sentinel = uuid.uuid4().hex
+    while sentinel in normalized:
+        sentinel = uuid.uuid4().hex
+
     code_blocks: list[str] = []
 
     def _stash_code(match: re.Match[str]) -> str:
         code_blocks.append(match.group(0))
-        return f"@@CODEBLOCK_{len(code_blocks) - 1}@@"
+        return f"CODEBLOCK-{sentinel}-{len(code_blocks) - 1}"
 
-    protected = re.sub(r"```[\s\S]*?```", _stash_code, raw_markdown)
+    protected = _FENCE_RE.sub(_stash_code, normalized)
 
-    # Convert Markdown image badges: ![alt](https://img.shields.io/...)
+    # Convert linked Markdown image badges first: [![alt](badge)](url)
+    def _linked_md_badge_sub(match: re.Match[str]) -> str:
+        alt, img_url, link_url = match.group(1), match.group(2), match.group(3)
+        badge = _parse_shields_badge(img_url, alt)
+        if badge:
+            badge.url = link_url
+            return _encode_badge_token(badge)
+        alt_clean = alt.strip()
+        if alt_clean:
+            return f"[*{alt_clean}*]({link_url})"
+        return ""
+
+    protected = _LINKED_MD_IMG_RE.sub(_linked_md_badge_sub, protected)
+
+    # Convert standalone Markdown image badges: ![alt](https://img.shields.io/...)
     def _md_badge_sub(match: re.Match[str]) -> str:
         alt, url = match.group(1), match.group(2)
         badge = _parse_shields_badge(url, alt)
         if badge:
-            return f"[[BADGE:{badge.label}|{badge.color}]]"
+            return _encode_badge_token(badge)
         return f"*{alt}*" if alt else ""
 
-    protected = re.sub(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", _md_badge_sub, protected)
+    protected = _MD_IMG_RE.sub(_md_badge_sub, protected)
 
     soup = BeautifulSoup(protected, "html.parser")
 
@@ -211,20 +336,30 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
         alt = str(img.get("alt", "")).strip()
         badge = _parse_shields_badge(src, alt)
         if badge:
-            img.replace_with(f" [[BADGE:{badge.label}|{badge.color}]] ")
+            img.replace_with(f" {_encode_badge_token(badge)} ")
         elif alt:
             img.replace_with(f"*{alt}*")
         else:
             img.decompose()
 
-    # 2. Convert inline formatting BEFORE tables so cell formatting is preserved
+    # 2. Convert inline formatting BEFORE lists & tables so formatting is preserved
     for tag in soup.find_all(["strong", "b"]):
         text = tag.get_text(" ", strip=True)
-        tag.replace_with(f"**{text}**" if text else "")
+        if not text:
+            tag.replace_with("")
+        elif BADGE_TOKEN_RE.search(text):
+            tag.replace_with(text)
+        else:
+            tag.replace_with(f"**{text}**")
 
     for tag in soup.find_all(["em", "i"]):
         text = tag.get_text(" ", strip=True)
-        tag.replace_with(f"*{text}*" if text else "")
+        if not text:
+            tag.replace_with("")
+        elif BADGE_TOKEN_RE.search(text):
+            tag.replace_with(text)
+        else:
+            tag.replace_with(f"*{text}*")
 
     for code in soup.find_all("code"):
         text = code.get_text(strip=True)
@@ -233,9 +368,24 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
 
     for a in soup.find_all("a"):
         inner = a.get_text(" ", strip=True)
-        href = a.get("href", "")
-        if "[[BADGE:" in inner:
-            a.replace_with(f" {inner} ")
+        href = str(a.get("href", "") or "").strip()
+        if BADGE_TOKEN_RE.search(inner):
+            def _attach_href(match: re.Match[str], link: str = href) -> str:
+                badge = _decode_badge_token(match.group(1), match.group(2), match.group(3))
+                if link and not badge.url:
+                    badge.url = link
+                return _encode_badge_token(badge)
+
+            updated = BADGE_TOKEN_RE.sub(_attach_href, inner)
+            non_badge = BADGE_TOKEN_RE.sub("", updated).strip()
+            if non_badge and href:
+                badge_only = " ".join(
+                    _encode_badge_token(_decode_badge_token(*m))
+                    for m in BADGE_TOKEN_RE.findall(updated)
+                )
+                a.replace_with(f" {badge_only} [{non_badge}]({href}) ")
+            else:
+                a.replace_with(f" {updated} ")
         elif inner and href:
             a.replace_with(f"[{inner}]({href})")
         else:
@@ -247,20 +397,19 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
     for hr in soup.find_all("hr"):
         hr.replace_with("\n\n---\n\n")
 
-    # 3. Convert HTML headings and lists
+    # 3. Convert HTML headings and nested lists
     for level in range(1, 7):
         for h in soup.find_all(f"h{level}"):
             text = h.get_text(" ", strip=True)
             h.replace_with(f"\n\n{'#' * level} {text}\n\n")
 
-    for li in soup.find_all("li"):
-        text = li.get_text(" ", strip=True)
-        li.replace_with(f"- {text}\n")
-
     for lst in soup.find_all(["ul", "ol"]):
-        lst.insert_before("\n")
-        lst.insert_after("\n")
-        lst.unwrap()
+        if lst.find_parent(["ul", "ol"]) is None:
+            lst.replace_with("\n" + _convert_list(lst) + "\n")
+
+    for li in soup.find_all("li"):
+        text = _normalize_inline(li.get_text(" ", strip=True))
+        li.replace_with(f"- {text}\n" if text else "")
 
     # 4. Convert HTML tables (preserving bold, code, and line breaks inside cells)
     for table in soup.find_all("table"):
@@ -278,12 +427,11 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
         if isinstance(span, Tag):
             span.unwrap()
 
-    cleaned = str(soup)
+    cleaned = re.sub(r"\n{3,}", "\n\n", soup.decode(formatter=None)).strip()
 
-    for idx, block in enumerate(code_blocks):
-        cleaned = cleaned.replace(f"@@CODEBLOCK_{idx}@@", block)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if code_blocks:
+        restore_re = re.compile(rf"CODEBLOCK-{re.escape(sentinel)}-(\d+)")
+        cleaned = restore_re.sub(lambda m: code_blocks[int(m.group(1))], cleaned)
 
     # Split into alternating Markdown and Badge-row segments
     segments: list[ReadmeSegment] = []
@@ -302,9 +450,12 @@ def preprocess_readme(raw_markdown: str) -> list[ReadmeSegment]:
             if remainder:
                 md_buffer.append(remainder)
             _flush_md()
-            badges = [Badge(label=lbl, color=col) for lbl, col in found_badges]
-            if segments and segments[-1].kind == "badges":
-                assert isinstance(segments[-1].content, list)
+            badges = [_decode_badge_token(lbl, col, url) for lbl, col, url in found_badges]
+            if (
+                segments
+                and segments[-1].kind == "badges"
+                and isinstance(segments[-1].content, list)
+            ):
                 segments[-1].content.extend(badges)
             else:
                 segments.append(ReadmeSegment(kind="badges", content=badges))
